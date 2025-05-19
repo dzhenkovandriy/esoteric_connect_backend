@@ -1,97 +1,107 @@
-# app.py
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from flask_login import (
-    LoginManager, UserMixin, login_user, logout_user, login_required
-)
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required
 from werkzeug.utils import secure_filename
 import uuid, os
 
-# ────────── базовая конфигурация ──────────
+# ── конфигурация ──────────────────────
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "changeme-secret-key"
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///data.db"
+
+# База: SQLite локально, PostgreSQL в проде
+db_url = os.getenv("DATABASE_URL", "sqlite:///data.db")
+# Render отдаёт URL типа postgres:// → SQLAlchemy ждёт postgresql+psycopg2://
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 CORS(app, supports_credentials=True)
+db      = SQLAlchemy(app)
+bcrypt  = Bcrypt(app)
+login_m = LoginManager(app)
 
-db     = SQLAlchemy(app)
-bcrypt = Bcrypt(app)
-login_mgr = LoginManager(app)
-
-
-# ────────── модель ──────────
+# ── модель ────────────────────────────
 class User(db.Model, UserMixin):
-    __tablename__ = "users" 
+    __tablename__ = "users"
     id            = db.Column(db.Integer, primary_key=True)
     email         = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
-    role          = db.Column(db.String(20), default="client")   # client | master | admin
+    role          = db.Column(db.String(20), default="client")          # client | master | admin
     name          = db.Column(db.String(80))
     photo         = db.Column(db.String(255))
     specialty     = db.Column(db.String(80))
 
     def to_dict(self):
-        return {
-            "id": self.id,
-            "name": self.name,
-            "photo": self.photo,
-            "specialty": self.specialty,
-            "role": self.role
-        }
+        return {"id": self.id, "name": self.name, "photo": self.photo,
+                "specialty": self.specialty, "role": self.role}
 
-@login_mgr.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+@login_m.user_loader
+def load_user(user_id): return User.query.get(int(user_id))
 
-# ────────── загрузка фото ──────────
+# ── upload фото ───────────────────────
 UPLOAD_DIR = os.path.join(app.root_path, "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-ALLOWED = {"jpg", "jpeg", "png", "gif", "webp"}
+ALLOWED = {"jpg","jpeg","png","gif","webp"}
 
 @app.post("/api/upload")
 def api_upload():
-    if "file" not in request.files:
-        return {"error": "no file"}, 400
-    f = request.files["file"]
-    ext = f.filename.rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED:
-        return {"error": "bad type"}, 400
-    filename = f"{uuid.uuid4().hex}.{ext}"
-    path = os.path.join(UPLOAD_DIR, secure_filename(filename))
-    f.save(path)
-    return {"url": f"/static/uploads/{filename}"}, 201
+    if "file" not in request.files: return {"error":"no file"},400
+    f=request.files["file"]; ext=f.filename.rsplit(".",1)[-1].lower()
+    if ext not in ALLOWED:   return {"error":"bad type"},400
+    name=f"{uuid.uuid4().hex}.{ext}"
+    f.save(os.path.join(UPLOAD_DIR,secure_filename(name)))
+    return {"url":f"/static/uploads/{name}"},201
 
-# ────────── публичные мастера ──────────
+# ── маршруты мастеров ─────────────────
 @app.get("/api/masters")
 def api_masters():
-    masters = User.query.filter_by(role="master").all()
-    return jsonify([m.to_dict() for m in masters])
+    return jsonify([m.to_dict() for m in User.query.filter_by(role="master")])
 
-# ────────── регистрация ──────────
 @app.post("/api/register")
 def api_register():
-    data = request.get_json()
-    if not data.get("email") or not data.get("password"):
-        return {"error": "missing fields"}, 400
-    if User.query.filter_by(email=data["email"]).first():
-        return {"error": "exists"}, 400
-    pw_hash = bcrypt.generate_password_hash(data["password"]).decode("utf-8")
-    user = User(
-        email=data["email"],
-        password_hash=pw_hash,
-        role=data.get("role", "client"),
-        name=data.get("name", ""),
-        photo=data.get("photo", ""),
-        specialty=data.get("specialty", "")
-    )
-    db.session.add(user)
-    db.session.commit()
-    return {"msg": "registered"}, 201
+    d=request.get_json()
+    if not d.get("email") or not d.get("password"): return {"error":"missing"},400
+    if User.query.filter_by(email=d["email"]).first(): return {"error":"exists"},400
+    u=User(email=d["email"],
+           password_hash=bcrypt.generate_password_hash(d["password"]).decode("utf-8"),
+           role=d.get("role","client"),
+           name=d.get("name",""),
+           photo=d.get("photo",""),
+           specialty=d.get("specialty",""))
+    db.session.add(u); db.session.commit()
+    return {"msg":"registered"},201
 
-# ────────── логин / логаут ──────────
 @app.post("/api/login")
 def api_login():
-    data = request.get_json()
-    user = User.query.filter_by(email=data.get("email"))._
+    d=request.get_json()
+    u=User.query.filter_by(email=d.get("email")).first()
+    if u and bcrypt.check_password_hash(u.password_hash,d.get("password")):
+        login_user(u); return {"msg":"ok","user":u.to_dict()}
+    return {"error":"invalid"},401
+
+@app.post("/api/logout")
+@login_required
+def api_logout(): logout_user(); return {"msg":"logged out"}
+
+# ── демо-мастера ──────────────────────
+def seed_demo():
+    if User.query.filter_by(role="master").count()>=3: return
+    demo=[
+      ("elena@demo","Elena Star","Astrologer","https://randomuser.me/api/portraits/women/44.jpg"),
+      ("maxim@demo","Maxim Aura","Tarot Reader","https://randomuser.me/api/portraits/men/45.jpg"),
+      ("natalie@demo","Natalie Numbers","Numerologist","https://randomuser.me/api/portraits/women/68.jpg"),
+    ]
+    for e,n,s,p in demo:
+        if User.query.filter_by(email=e).first(): continue
+        db.session.add(User(email=e,password_hash=bcrypt.generate_password_hash("pass").decode("utf-8"),
+                            role="master",name=n,photo=p,specialty=s))
+    db.session.commit()
+
+with app.app_context():
+    db.create_all(); seed_demo()
+
+if __name__=="__main__":
+    app.run(port=int(os.getenv("PORT",5000)),debug=True)
